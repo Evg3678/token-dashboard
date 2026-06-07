@@ -7,6 +7,7 @@ import io
 import requests
 import time
 import xml.etree.ElementTree as ET
+import plotly.io as pio
 
 import sys
 import warnings
@@ -28,19 +29,16 @@ def show_instructions():
     
     ### 💱 Выбор валюты:
     - Включите чекбокс **"Показывать цены в рублях"**
-    - Используются официальные курсы ЦБ РФ
+    - Используются официальные курсы ЦБ РФ (код валюты: USD (R01235))
     - Каждая операция пересчитывается по курсу на **ДЕНЬ операции**
-    
-    ### 📊 Источник данных о курсах валют:
-    - Официальный API Центрального Банка РФ
-    - Код валюты: **USD (R01235)**
     
     ### 📈 Что вы получите:
     - Ключевые метрики (стоимость, токены, запросы)
     - Графики динамики затрат и распределения токенов
     - Детальную статистику по моделям, проектам и API-ключам
+    - Тепловую карту затрат по API-ключам
     - Топ-10 самых дорогих запросов
-    - Экспорт отчётов в HTML и CSV
+    - Экспорт отчётов в HTML и CSV с цветными графиками
     """)
 
 # Функция для получения курса USD на конкретную дату
@@ -56,7 +54,7 @@ def get_usd_rate_cbr(target_date):
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept': 'text/html,application/xml;q=0.9,*/*;q=0.8',
         }
         
         response = requests.get(url, timeout=15, headers=headers)
@@ -128,10 +126,157 @@ def rename_api_keys(api_key_name):
     }
     return rename_map.get(api_key_name, api_key_name)
 
-# Функция для создания HTML-отчёта
+# Функция для создания цветных графиков для HTML отчёта
+def create_colored_charts(df, currency_symbol):
+    """Создание цветных графиков для HTML отчёта"""
+    
+    # График 1: Динамика затрат
+    daily_cost = df.groupby('date')['cost_display'].sum().reset_index()
+    fig_cost = go.Figure()
+    fig_cost.add_trace(go.Scatter(
+        x=daily_cost['date'],
+        y=daily_cost['cost_display'],
+        mode='lines+markers',
+        name='Затраты',
+        line=dict(color='#667eea', width=3),
+        marker=dict(size=8, color='#764ba2', symbol='circle')
+    ))
+    fig_cost.update_layout(
+        title=f'<b>Динамика затрат ({currency_symbol})</b>',
+        xaxis_title='Дата',
+        yaxis_title=f'Стоимость ({currency_symbol})',
+        hovermode='x unified',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        title_font_size=16,
+        title_font_color='#2c3e50',
+        height=400
+    )
+    fig_cost.update_xaxes(showgrid=True, gridwidth=1, gridcolor='#e0e0e0')
+    fig_cost.update_yaxes(showgrid=True, gridwidth=1, gridcolor='#e0e0e0')
+    
+    # График 2: Распределение токенов
+    token_data = []
+    token_colors = []
+    if df['tokens_prompt'].sum() > 0:
+        token_data.append(('Входящие', df['tokens_prompt'].sum()))
+        token_colors.append('#667eea')
+    if df['tokens_completion'].sum() > 0:
+        token_data.append(('Исходящие', df['tokens_completion'].sum()))
+        token_colors.append('#764ba2')
+    if df['tokens_reasoning'].sum() > 0:
+        token_data.append(('Рассуждений', df['tokens_reasoning'].sum()))
+        token_colors.append('#f093fb')
+    if df['tokens_cached'].sum() > 0:
+        token_data.append(('Кэшированные', df['tokens_cached'].sum()))
+        token_colors.append('#4facfe')
+    
+    fig_pie = go.Figure(data=[go.Pie(
+        labels=[item[0] for item in token_data],
+        values=[item[1] for item in token_data],
+        marker=dict(colors=token_colors),
+        hole=0.3,
+        textinfo='percent+label',
+        textposition='auto'
+    )])
+    fig_pie.update_layout(
+        title='<b>Распределение токенов по типам</b>',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        title_font_size=16,
+        title_font_color='#2c3e50',
+        height=450
+    )
+    
+    # График 3: Расходы по моделям
+    model_cost = df.groupby('model_permaslug')['cost_display'].sum().reset_index()
+    model_cost = model_cost.nlargest(10, 'cost_display')
+    colors_model = ['#667eea', '#764ba2', '#f093fb', '#4facfe', '#43e97b', '#fa709a', '#fee140', '#30cfd0', '#a8edea', '#fed6e3']
+    
+    fig_models = go.Figure(data=[go.Pie(
+        labels=model_cost['model_permaslug'],
+        values=model_cost['cost_display'],
+        marker=dict(colors=colors_model[:len(model_cost)]),
+        textinfo='percent+label',
+        textposition='auto'
+    )])
+    fig_models.update_layout(
+        title=f'<b>Доля затрат по моделям ({currency_symbol})</b>',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        title_font_size=16,
+        title_font_color='#2c3e50',
+        height=450
+    )
+    
+    # График 4: Тепловая карта по API-ключам
+    api_daily = df.groupby(['api_key_name', 'date'])['cost_display'].sum().reset_index()
+    pivot_api = api_daily.pivot(index='api_key_name', columns='date', values='cost_display').fillna(0)
+    
+    if len(pivot_api) > 0:
+        fig_heatmap = go.Figure(data=go.Heatmap(
+            z=pivot_api.values,
+            x=[d.strftime('%d.%m') for d in pivot_api.columns],
+            y=pivot_api.index,
+            colorscale='Viridis',
+            text=pivot_api.values.round(2),
+            texttemplate='%{text}',
+            textfont={"size": 10},
+            hoverongaps=False
+        ))
+        fig_heatmap.update_layout(
+            title=f'<b>Тепловая карта затрат по API-ключам ({currency_symbol})</b>',
+            xaxis_title='Дата',
+            yaxis_title='API-ключ',
+            plot_bgcolor='white',
+            paper_bgcolor='white',
+            title_font_size=16,
+            title_font_color='#2c3e50',
+            height=400
+        )
+        heatmap_html = pio.to_html(fig_heatmap, full_html=False, include_plotlyjs=False)
+    else:
+        heatmap_html = "<p>Нет данных для тепловой карты</p>"
+    
+    # График 5: Расходы по провайдерам
+    provider_cost = df.groupby('provider_name')['cost_display'].sum().reset_index()
+    fig_providers = go.Figure()
+    fig_providers.add_trace(go.Bar(
+        x=provider_cost['provider_name'],
+        y=provider_cost['cost_display'],
+        marker_color='#667eea',
+        text=provider_cost['cost_display'].apply(lambda x: f'{currency_symbol}{x:,.2f}'),
+        textposition='outside'
+    ))
+    fig_providers.update_layout(
+        title=f'<b>Затраты по провайдерам ({currency_symbol})</b>',
+        xaxis_title='Провайдер',
+        yaxis_title=f'Стоимость ({currency_symbol})',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        title_font_size=16,
+        title_font_color='#2c3e50',
+        height=400
+    )
+    fig_providers.update_xaxes(tickangle=-45, showgrid=True, gridwidth=1, gridcolor='#e0e0e0')
+    fig_providers.update_yaxes(showgrid=True, gridwidth=1, gridcolor='#e0e0e0')
+    
+    # Конвертируем в HTML
+    cost_graph_html = pio.to_html(fig_cost, full_html=False, include_plotlyjs='cdn')
+    pie_graph_html = pio.to_html(fig_pie, full_html=False, include_plotlyjs=False)
+    models_graph_html = pio.to_html(fig_models, full_html=False, include_plotlyjs=False)
+    providers_graph_html = pio.to_html(fig_providers, full_html=False, include_plotlyjs=False)
+    
+    return cost_graph_html, pie_graph_html, models_graph_html, heatmap_html, providers_graph_html
+
+# Функция для создания HTML-отчёта с цветными графиками
 def create_html_report(df, model_details, project_details, api_key_details, expensive, currency_symbol):
     report_date = datetime.now().strftime('%d.%m.%Y %H:%M:%S')
     
+    # Создаем цветные графики
+    cost_graph_html, pie_graph_html, models_graph_html, heatmap_html, providers_graph_html = create_colored_charts(df, currency_symbol)
+    
+    # Подготовка таблиц
     model_display = model_details.copy()
     project_display = project_details.copy()
     api_display = api_key_details.copy()
@@ -165,6 +310,7 @@ def create_html_report(df, model_details, project_details, api_key_details, expe
     <head>
         <meta charset="UTF-8">
         <title>Отчёт по использованию AI-моделей</title>
+        <script src="https://cdn.plot.ly/plotly-3.0.1.min.js" charset="utf-8"></script>
         <style>
             * {{ margin: 0; padding: 0; box-sizing: border-box; }}
             body {{
@@ -191,10 +337,15 @@ def create_html_report(df, model_details, project_details, api_key_details, expe
             .content {{ padding: 30px; }}
             h2 {{
                 color: #2c3e50;
-                font-size: 20px;
+                font-size: 24px;
                 margin: 30px 0 15px 0;
                 padding-bottom: 10px;
                 border-bottom: 3px solid #667eea;
+            }}
+            h3 {{
+                color: #2c3e50;
+                font-size: 20px;
+                margin: 20px 0 15px 0;
             }}
             .metrics {{
                 display: grid;
@@ -208,9 +359,20 @@ def create_html_report(df, model_details, project_details, api_key_details, expe
                 padding: 20px;
                 border-radius: 15px;
                 text-align: center;
+                transition: transform 0.3s;
+            }}
+            .metric:hover {{
+                transform: translateY(-5px);
             }}
             .metric-value {{ font-size: 28px; font-weight: bold; margin-bottom: 8px; }}
             .metric-label {{ font-size: 13px; opacity: 0.9; }}
+            .graph-container {{
+                margin: 30px 0;
+                padding: 20px;
+                background: #f8f9fa;
+                border-radius: 15px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }}
             table {{
                 width: 100%;
                 border-collapse: collapse;
@@ -218,7 +380,7 @@ def create_html_report(df, model_details, project_details, api_key_details, expe
                 font-size: 13px;
             }}
             th {{
-                background: #667eea;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                 color: white;
                 padding: 12px;
                 text-align: left;
@@ -234,6 +396,15 @@ def create_html_report(df, model_details, project_details, api_key_details, expe
                 text-align: center;
                 font-size: 12px;
                 color: #666;
+            }}
+            @media print {{
+                body {{
+                    background: white;
+                    padding: 0;
+                }}
+                .graph-container {{
+                    break-inside: avoid;
+                }}
             }}
         </style>
     </head>
@@ -266,13 +437,40 @@ def create_html_report(df, model_details, project_details, api_key_details, expe
                     </div>
                 </div>
                 
-                <h2>🎲 Статистика по моделям</h2>
+                <h2>📈 Визуализация данных</h2>
+                
+                <div class="graph-container">
+                    <h3>💰 Динамика затрат</h3>
+                    {cost_graph_html}
+                </div>
+                
+                <div class="graph-container">
+                    <h3>🎯 Распределение токенов по типам</h3>
+                    {pie_graph_html}
+                </div>
+                
+                <div class="graph-container">
+                    <h3>🤖 Доля затрат по моделям</h3>
+                    {models_graph_html}
+                </div>
+                
+                <div class="graph-container">
+                    <h3>🏢 Затраты по провайдерам</h3>
+                    {providers_graph_html}
+                </div>
+                
+                <div class="graph-container">
+                    <h3>🔥 Тепловая карта затрат по API-ключам</h3>
+                    {heatmap_html}
+                </div>
+                
+                <h2>🎲 Детальная статистика по моделям</h2>
                 {model_display.to_html(index=False)}
                 
-                <h2>📋 Статистика по проектам</h2>
+                <h2>📋 Детальная статистика по проектам</h2>
                 {project_display.to_html(index=False)}
                 
-                <h2>🔑 Статистика по API-ключам</h2>
+                <h2>🔑 Детальная статистика по API-ключам</h2>
                 {api_display.to_html(index=False)}
                 
                 <h2>💰 Топ-10 самых дорогих запросов</h2>
@@ -281,6 +479,7 @@ def create_html_report(df, model_details, project_details, api_key_details, expe
             
             <div class="footer">
                 <p>🤖 Отчёт сгенерирован автоматически дашбордом аналитики токенов ИИ</p>
+                <p style="margin-top: 10px">📊 Все графики интерактивны - наводите курсор для деталей</p>
             </div>
         </div>
     </body>
@@ -472,7 +671,6 @@ if uploaded_file is not None:
         # Детализация расходов по дням
         if len(daily_cost) > 0:
             with st.expander("📊 Детализация расходов по дням", expanded=False):
-                # Собираем детальную информацию по дням
                 daily_detail = filtered_df.groupby('date').agg({
                     'cost_display': 'sum',
                     'generation_id': 'count',
@@ -486,31 +684,25 @@ if uploaded_file is not None:
                     'total_tokens': 'sum'
                 }).reset_index()
                 
-                # Сортируем хронологически
                 daily_detail = daily_detail.sort_values('date')
                 daily_detail['date'] = pd.to_datetime(daily_detail['date']).dt.strftime('%d.%m.%Y')
                 
-                # Рассчитываем долю затрат
                 total_sum = daily_detail['cost_display'].sum()
                 daily_detail['Доля затрат'] = (daily_detail['cost_display'] / total_sum * 100).round(2)
                 
-                # Переименовываем колонки
                 daily_detail.columns = [
                     'Дата', 'Стоимость', 'Запросы', 'Модели', 'API-ключи', 'Проекты',
                     'Входящие', 'Исходящие', 'Рассуждений', 'Кэшированные', 'Всего токенов', 'Доля затрат (%)'
                 ]
                 
-                # Форматируем
                 daily_detail['Стоимость'] = daily_detail['Стоимость'].apply(lambda x: f"{currency_symbol}{x:,.2f}")
                 daily_detail['Доля затрат (%)'] = daily_detail['Доля затрат (%)'].apply(lambda x: f"{x:.2f}%")
                 
-                # Добавляем разделители тысяч для чисел
                 for col in ['Запросы', 'Модели', 'API-ключи', 'Проекты', 'Входящие', 'Исходящие', 'Рассуждений', 'Кэшированные', 'Всего токенов']:
                     daily_detail[col] = daily_detail[col].apply(lambda x: f"{int(x):,}")
                 
                 st.dataframe(daily_detail, use_container_width=True, hide_index=True)
                 
-                # Итоговая статистика
                 st.markdown("---")
                 col_a, col_b, col_c, col_d = st.columns(4)
                 with col_a:
@@ -610,14 +802,31 @@ if uploaded_file is not None:
         
         # Экспорт отчёта
         st.header("📥 Экспорт отчёта")
-        html_report = create_html_report(filtered_df, model_details, project_details, api_details, expensive, currency_symbol)
+        
+        # Подготовка данных для экспорта
+        model_details_export = model_details.copy()
+        project_details_export = project_details.copy()
+        api_details_export = api_details.copy()
+        expensive_export = expensive.copy()
+        
+        html_report = create_html_report(filtered_df, model_details_export, project_details_export, 
+                                         api_details_export, expensive_export, currency_symbol)
         
         col1, col2 = st.columns(2)
         with col1:
-            st.download_button("📄 Скачать HTML отчёт", html_report.encode('utf-8'), f"ai_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html", "text/html", use_container_width=True)
+            st.download_button("📄 Скачать HTML отчёт", 
+                              html_report.encode('utf-8'), 
+                              f"ai_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html", 
+                              "text/html", 
+                              use_container_width=True)
+        
         with col2:
             csv_data = filtered_df.to_csv(index=False).encode('utf-8-sig')
-            st.download_button("📊 Скачать CSV данные", csv_data, f"filtered_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", "text/csv", use_container_width=True)
+            st.download_button("📊 Скачать CSV данные", 
+                              csv_data, 
+                              f"filtered_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", 
+                              "text/csv", 
+                              use_container_width=True)
     
     except Exception as e:
         st.error(f"❌ Ошибка при обработке файла: {str(e)}")
