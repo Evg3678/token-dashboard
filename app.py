@@ -8,6 +8,10 @@ import requests
 import time
 import xml.etree.ElementTree as ET
 
+import sys
+import warnings
+warnings.filterwarnings('ignore')
+
 # Настройка страницы
 st.set_page_config(page_title="Анализ токенов ИИ", layout="wide")
 st.title("🤖 Дашборд аналитики токенов ИИ")
