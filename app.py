@@ -5,520 +5,616 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import io
 import requests
-from dateutil import parser
-import numpy as np
+import time
 import xml.etree.ElementTree as ET
 
 # Настройка страницы
 st.set_page_config(page_title="Анализ токенов ИИ", layout="wide")
 st.title("🤖 Дашборд аналитики токенов ИИ")
 
-# Кэширование курсов валют (обновляем каждый час)
-@st.cache_data(ttl=3600)
-def get_cbr_rates_alternative(target_date):
-    """
-    Получает курсы валют от ЦБ РФ через зеркало cbr-xml-daily.ru
-    Возвращает словарь {код_валюты: курс}
-    """
-    # Форматируем дату для API
-    if isinstance(target_date, (datetime, pd.Timestamp)):
-        date_str = target_date.strftime('%Y-%m-%d')
-    else:
-        date_str = target_date
+# Функция для отображения инструкции
+def show_instructions():
+    st.markdown("""
+    ### 📚 Как использовать дашборд:
     
-    # Используем альтернативное API, которое не блокирует запросы
-    url = f"https://www.cbr-xml-daily.ru/archive/{date_str}/daily.xml"
+    1. **Подготовьте CSV файл** с вашими логами
+    2. **Нажмите "Upload CSV файл"** выше
+    3. **Выберите файл** для загрузки
+    4. **Используйте фильтры** в левой боковой панели
+    
+    ### 💱 Выбор валюты:
+    - Включите чекбокс **"Показывать цены в рублях"**
+    - Используются официальные курсы ЦБ РФ
+    - Каждая операция пересчитывается по курсу на **ДЕНЬ операции**
+    
+    ### 📊 Источник данных о курсах валют:
+    - Официальный API Центрального Банка РФ
+    - Код валюты: **USD (R01235)**
+    
+    ### 📈 Что вы получите:
+    - Ключевые метрики (стоимость, токены, запросы)
+    - Графики динамики затрат и распределения токенов
+    - Детальную статистику по моделям, проектам и API-ключам
+    - Топ-10 самых дорогих запросов
+    - Экспорт отчётов в HTML и CSV
+    """)
+
+# Функция для получения курса USD на конкретную дату
+def get_usd_rate_cbr(target_date):
+    if isinstance(target_date, (datetime, pd.Timestamp)):
+        date_obj = target_date
+    else:
+        date_obj = target_date
+    
+    date_str = date_obj.strftime('%d/%m/%Y')
+    url = f"https://cbr.ru/scripts/XML_daily.asp?date_req={date_str}"
     
     try:
-        response = requests.get(url, timeout=10, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        }
         
-        if response.status_code != 200:
-            # Пробуем без даты (последний доступный курс)
-            url = "https://www.cbr-xml-daily.ru/daily.xml"
-            response = requests.get(url, timeout=10, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            })
-            if response.status_code != 200:
-                return None
+        response = requests.get(url, timeout=15, headers=headers)
         
-        # Парсим XML
-        root = ET.fromstring(response.content)
-        
-        rates = {}
-        for valute in root.findall('.//Valute'):
-            char_code = valute.find('CharCode')
-            value = valute.find('Value')
-            nominal = valute.find('Nominal')
+        if response.status_code == 200:
+            root = ET.fromstring(response.content)
             
-            if char_code is not None and value is not None and nominal is not None:
-                code = char_code.text
-                rate_value = float(value.text.replace(',', '.'))
-                rate_nominal = float(nominal.text)
-                rates[code] = rate_value / rate_nominal
-        
-        # Добавляем рубль
-        rates['RUB'] = 1.0
-        
-        return rates
+            for valute in root.findall('.//Valute'):
+                char_code = valute.find('CharCode')
+                if char_code is not None and char_code.text == 'USD':
+                    value = valute.find('Value')
+                    if value is not None:
+                        rate_str = value.text.replace(',', '.')
+                        rate = float(rate_str)
+                        return rate
+        return None
     except Exception as e:
         return None
 
-def get_closest_rates_alternative(dates_list, max_age_days=7):
-    """
-    Получает курсы для набора дат через альтернативное API
-    """
-    if isinstance(dates_list, np.ndarray):
-        dates_list = dates_list.tolist()
-    
-    unique_dates = sorted(set(dates_list))
-    rates_cache = {}
+# Функция для загрузки курсов с прогресс-баром
+@st.cache_data(ttl=3600)
+def load_rates_for_dates(dates_list):
+    rates = {}
+    sorted_dates = sorted(dates_list)
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    for i, date in enumerate(unique_dates):
-        status_text.text(f"Загрузка курсов... {i+1}/{len(unique_dates)}")
-        progress_bar.progress((i + 1) / len(unique_dates))
+    for i, date_obj in enumerate(sorted_dates):
+        progress = (i + 1) / len(sorted_dates)
+        progress_bar.progress(progress, text=f"Загрузка курсов: {i+1}/{len(sorted_dates)}")
+        status_text.info(f"📅 {date_obj.strftime('%d.%m.%Y')}")
         
-        rates = get_cbr_rates_alternative(date)
-        
-        if rates is None:
-            current_date = date - timedelta(days=1)
-            attempts = 0
-            while attempts < max_age_days and current_date >= date - timedelta(days=max_age_days):
-                rates = get_cbr_rates_alternative(current_date)
-                if rates is not None:
-                    st.info(f"ℹ️ Для даты {date} использован курс от {current_date}")
-                    break
-                current_date -= timedelta(days=1)
-                attempts += 1
-        
-        if rates is not None:
-            rates_cache[date] = rates
+        rate = get_usd_rate_cbr(date_obj)
+        if rate is not None:
+            rates[date_obj] = rate
         else:
-            st.warning(f"⚠️ Не удалось получить курс для даты {date}")
+            rates[date_obj] = None
+        
+        time.sleep(0.05)
     
     progress_bar.empty()
     status_text.empty()
+    st.success(f"✅ Загружено {len(sorted_dates)} курсов")
+    time.sleep(0.5)
+    st.empty()
     
-    return rates_cache
+    # Интерполяция пропущенных значений
+    rates_df = pd.DataFrame([{"date": k, "rate": v} for k, v in rates.items()])
+    rates_df['date'] = pd.to_datetime(rates_df['date'])
+    rates_df = rates_df.sort_values('date')
+    rates_df['rate'] = rates_df['rate'].ffill().bfill()
+    
+    if rates_df['rate'].isna().any():
+        rates_df['rate'] = rates_df['rate'].fillna(90.0)
+    
+    return dict(zip(rates_df['date'].dt.date, rates_df['rate']))
 
-def convert_to_rub(row, rates_cache):
-    """Конвертирует сумму из USD в RUB по курсу на дату операции"""
-    date = row['date']
-    amount_usd = row['cost_total']
+# Функция для переименования API-ключей
+def rename_api_keys(api_key_name):
+    rename_map = {
+        'key_1': 'Бета стенд (Юрченко)',
+        'key_2': 'Дообучение (Соколов)',
+        'key_3': 'Разработка (Юрченко)',
+        'key_4': 'Разработка (Мошков)',
+        'key_5': 'Мейн стенд (Юрченко, Ильинов)',
+        'key_6': 'Агент подписки (Мамедов)',
+        'key_7': 'Аргумент (Кошелев)'
+    }
+    return rename_map.get(api_key_name, api_key_name)
+
+# Функция для создания HTML-отчёта
+def create_html_report(df, model_details, project_details, api_key_details, expensive, currency_symbol):
+    report_date = datetime.now().strftime('%d.%m.%Y %H:%M:%S')
     
-    if pd.isna(amount_usd) or amount_usd == 0:
-        return 0
+    model_display = model_details.copy()
+    project_display = project_details.copy()
+    api_display = api_key_details.copy()
+    expensive_display = expensive.copy()
     
-    if date in rates_cache and rates_cache[date] is not None:
-        usd_rate = rates_cache[date].get('USD')
-        if usd_rate:
-            return amount_usd * usd_rate
+    for col in model_display.columns:
+        if 'Стоимость' in col:
+            model_display[col] = model_display[col].apply(lambda x: f"{currency_symbol}{x:,.2f}")
+        if 'токены' in col or 'Всего' in col:
+            model_display[col] = model_display[col].apply(lambda x: f"{x:,}")
     
-    return 0
+    for col in project_display.columns:
+        if 'Стоимость' in col:
+            project_display[col] = project_display[col].apply(lambda x: f"{currency_symbol}{x:,.2f}")
+        if 'токены' in col or 'Всего' in col:
+            project_display[col] = project_display[col].apply(lambda x: f"{x:,}")
+    
+    for col in api_display.columns:
+        if 'Стоимость' in col:
+            api_display[col] = api_display[col].apply(lambda x: f"{currency_symbol}{x:,.2f}")
+        if 'токены' in col or 'Всего' in col:
+            api_display[col] = api_display[col].apply(lambda x: f"{x:,}")
+    
+    for col in expensive_display.columns:
+        if 'Стоимость' in col:
+            expensive_display[col] = expensive_display[col].apply(lambda x: f"{currency_symbol}{x:.4f}")
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Отчёт по использованию AI-моделей</title>
+        <style>
+            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                padding: 20px;
+            }}
+            .report {{
+                max-width: 1400px;
+                margin: 0 auto;
+                background: white;
+                border-radius: 20px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                overflow: hidden;
+            }}
+            .header {{
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 40px;
+                text-align: center;
+            }}
+            .header h1 {{ font-size: 32px; margin-bottom: 10px; }}
+            .header p {{ opacity: 0.9; font-size: 14px; }}
+            .content {{ padding: 30px; }}
+            h2 {{
+                color: #2c3e50;
+                font-size: 20px;
+                margin: 30px 0 15px 0;
+                padding-bottom: 10px;
+                border-bottom: 3px solid #667eea;
+            }}
+            .metrics {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 20px;
+                margin: 20px 0;
+            }}
+            .metric {{
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 20px;
+                border-radius: 15px;
+                text-align: center;
+            }}
+            .metric-value {{ font-size: 28px; font-weight: bold; margin-bottom: 8px; }}
+            .metric-label {{ font-size: 13px; opacity: 0.9; }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                margin: 15px 0;
+                font-size: 13px;
+            }}
+            th {{
+                background: #667eea;
+                color: white;
+                padding: 12px;
+                text-align: left;
+            }}
+            td {{
+                padding: 10px 12px;
+                border-bottom: 1px solid #e0e0e0;
+            }}
+            tr:hover td {{ background-color: #f5f5f5; }}
+            .footer {{
+                background: #f8f9fa;
+                padding: 20px;
+                text-align: center;
+                font-size: 12px;
+                color: #666;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="report">
+            <div class="header">
+                <h1>🤖 Отчёт по использованию AI-моделей</h1>
+                <p>📅 Дата формирования: {report_date}</p>
+                <p>📊 Период: {df['date'].min()} → {df['date'].max()}</p>
+                <p>💱 Валюта: {currency_symbol}</p>
+            </div>
+            
+            <div class="content">
+                <div class="metrics">
+                    <div class="metric">
+                        <div class="metric-value">{currency_symbol}{df['cost_display'].sum():,.2f}</div>
+                        <div class="metric-label">Общая стоимость</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-value">{df['total_tokens'].sum():,}</div>
+                        <div class="metric-label">Всего токенов</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-value">{len(df):,}</div>
+                        <div class="metric-label">Запросов</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-value">{df['generation_time_ms'].mean():.0f} мс</div>
+                        <div class="metric-label">Среднее время</div>
+                    </div>
+                </div>
+                
+                <h2>🎲 Статистика по моделям</h2>
+                {model_display.to_html(index=False)}
+                
+                <h2>📋 Статистика по проектам</h2>
+                {project_display.to_html(index=False)}
+                
+                <h2>🔑 Статистика по API-ключам</h2>
+                {api_display.to_html(index=False)}
+                
+                <h2>💰 Топ-10 самых дорогих запросов</h2>
+                {expensive_display.to_html(index=False)}
+            </div>
+            
+            <div class="footer">
+                <p>🤖 Отчёт сгенерирован автоматически дашбордом аналитики токенов ИИ</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html
 
 # Загрузка файла
-uploaded_file = st.file_uploader("Загрузите CSV с логами", type=['csv'])
+uploaded_file = st.file_uploader("Upload CSV файл", type=['csv'])
+
+if uploaded_file is None:
+    with st.expander("📋 Пример ожидаемого формата CSV", expanded=False):
+        st.markdown("""
+        **CSV файл должен содержать следующие колонки:**
+        - `created_at` - дата и время запроса
+        - `app_name` - название проекта
+        - `api_key_name` - идентификатор API-ключа
+        - `model_permaslug` - название модели
+        - `provider_name` - провайдер модели
+        - `tokens_prompt` - входящие токены
+        - `tokens_completion` - исходящие токены
+        - `tokens_reasoning` - токены рассуждений
+        - `tokens_cached` - кэшированные токены
+        - `cost_total` - стоимость в USD
+        - `generation_time_ms` - время генерации
+        - `generation_id` - ID запроса
+        """)
+    
+    show_instructions()
 
 if uploaded_file is not None:
-    # Читаем данные
-    df = pd.read_csv(uploaded_file)
-    
-    # Показываем сырые данные для отладки
-    with st.expander("🔍 Предпросмотр данных"):
-        st.write(f"Всего записей: {len(df)}")
-        st.write("Первые 5 строк:")
-        st.dataframe(df.head())
-        st.write("Типы данных:")
-        st.write(df.dtypes)
-    
-    # Приводим дату к нормальному виду
-    df['created_at'] = pd.to_datetime(df['created_at'])
-    df['date'] = df['created_at'].dt.date
-    
-    # ОЧИСТКА ДАННЫХ
-    df['app_name'] = df['app_name'].fillna('unknown').astype(str)
-    df['app_name'] = df['app_name'].replace('nan', 'unknown').replace('None', 'unknown')
-    
-    df['api_key_name'] = df['api_key_name'].fillna('unknown').astype(str)
-    df['api_key_name'] = df['api_key_name'].replace('nan', 'unknown').replace('None', 'unknown')
-    
-    df['model_permaslug'] = df['model_permaslug'].fillna('unknown').astype(str)
-    df['provider_name'] = df['provider_name'].fillna('unknown').astype(str)
-    
-    # Заполняем числовые поля
-    df['tokens_prompt'] = df['tokens_prompt'].fillna(0)
-    df['tokens_completion'] = df['tokens_completion'].fillna(0)
-    df['tokens_cached'] = df['tokens_cached'].fillna(0)
-    df['tokens_reasoning'] = df['tokens_reasoning'].fillna(0)
-    df['cost_total'] = df['cost_total'].fillna(0)
-    df['generation_time_ms'] = df['generation_time_ms'].fillna(0)
-    df['time_to_first_token_ms'] = df['time_to_first_token_ms'].fillna(0)
-    
-    # ===== ВЫБОР ВАЛЮТЫ =====
-    st.sidebar.header("💱 Настройки")
-    
-    # Чекбокс для выбора валюты
-    use_rub = st.sidebar.checkbox(
-        "💰 Показывать цены в рублях",
-        value=False,
-        help="Включите для отображения всех цен в рублях. Выключите для отображения в долларах США."
-    )
-    
-    # Получаем курсы валют, если нужны рубли
-    if use_rub:
-        with st.spinner("🔄 Загрузка курсов валют ЦБ РФ..."):
-            unique_dates = df['date'].unique()
-            rates_cache = get_closest_rates_alternative(unique_dates, max_age_days=30)
+    try:
+        with st.spinner("📊 Загрузка и обработка данных..."):
+            df = pd.read_csv(uploaded_file)
             
-            if rates_cache:
-                # Добавляем колонку со стоимостью в рублях
-                df['cost_rub'] = df.apply(
-                    lambda row: convert_to_rub(row, rates_cache), 
-                    axis=1
-                )
-                
-                # Создаём колонку с ценой в выбранной валюте
-                df['cost_display'] = df['cost_rub']
+            if 'api_key_name' in df.columns:
+                df['api_key_name'] = df['api_key_name'].apply(rename_api_keys)
+            
+            # Пробуем разные форматы дат
+            try:
+                df['created_at'] = pd.to_datetime(df['created_at'], format='%Y-%m-%d %H:%M:%S.%f')
+            except:
+                try:
+                    df['created_at'] = pd.to_datetime(df['created_at'])
+                except:
+                    st.error("❌ Не удалось распознать формат даты в колонке 'created_at'")
+                    st.stop()
+            
+            df['date'] = df['created_at'].dt.date
+            
+            df['app_name'] = df['app_name'].fillna('unknown').astype(str)
+            df['app_name'] = df['app_name'].replace('nan', 'unknown').replace('None', 'unknown')
+            df['api_key_name'] = df['api_key_name'].fillna('unknown').astype(str)
+            df['api_key_name'] = df['api_key_name'].replace('nan', 'unknown').replace('None', 'unknown')
+            df['model_permaslug'] = df['model_permaslug'].fillna('unknown').astype(str)
+            df['provider_name'] = df['provider_name'].fillna('unknown').astype(str)
+            
+            df['tokens_prompt'] = pd.to_numeric(df['tokens_prompt'], errors='coerce').fillna(0)
+            df['tokens_completion'] = pd.to_numeric(df['tokens_completion'], errors='coerce').fillna(0)
+            df['tokens_cached'] = pd.to_numeric(df['tokens_cached'], errors='coerce').fillna(0)
+            df['tokens_reasoning'] = pd.to_numeric(df['tokens_reasoning'], errors='coerce').fillna(0)
+            df['cost_total'] = pd.to_numeric(df['cost_total'], errors='coerce').fillna(0)
+            df['generation_time_ms'] = pd.to_numeric(df['generation_time_ms'], errors='coerce').fillna(0)
+            
+            df['total_tokens'] = (df['tokens_prompt'] + df['tokens_completion'] + 
+                                  df['tokens_reasoning'] + df['tokens_cached'])
+        
+        # Фильтры
+        st.sidebar.header("Фильтры")
+        
+        min_date = df['date'].min()
+        max_date = df['date'].max()
+        date_range = st.sidebar.date_input("Период", [min_date, max_date], min_value=min_date, max_value=max_date)
+        
+        selected_project = st.sidebar.selectbox("Проект", ['Все'] + sorted(df['app_name'].unique()))
+        selected_api_key = st.sidebar.selectbox("API-ключ", ['Все'] + sorted(df['api_key_name'].unique()))
+        selected_model = st.sidebar.selectbox("Модель", ['Все'] + sorted(df['model_permaslug'].unique()))
+        
+        mask = (df['date'] >= date_range[0]) & (df['date'] <= date_range[1])
+        filtered_df = df[mask]
+        
+        if selected_project != 'Все':
+            filtered_df = filtered_df[filtered_df['app_name'] == selected_project]
+        if selected_api_key != 'Все':
+            filtered_df = filtered_df[filtered_df['api_key_name'] == selected_api_key]
+        if selected_model != 'Все':
+            filtered_df = filtered_df[filtered_df['model_permaslug'] == selected_model]
+        
+        if len(filtered_df) == 0:
+            st.warning("⚠️ Нет данных для выбранных фильтров.")
+            st.stop()
+        
+        # Выбор валюты
+        st.sidebar.markdown("---")
+        st.sidebar.header("Настройки валюты")
+        
+        use_rub = st.sidebar.checkbox("Показывать цены в рублях", value=False)
+        
+        if use_rub:
+            unique_dates_list = sorted(filtered_df['date'].unique())
+            rates_dict = load_rates_for_dates(unique_dates_list)
+            
+            if rates_dict and any(v is not None for v in rates_dict.values()):
+                filtered_df['usd_rate'] = filtered_df['date'].apply(lambda x: rates_dict.get(x, 90.0))
+                filtered_df['cost_display'] = filtered_df['cost_total'] * filtered_df['usd_rate']
                 currency_symbol = "₽"
-                currency_name = "рублях"
-                
-                st.sidebar.success(f"✅ Курсы загружены ({len(rates_cache)} дат)")
-                
-                # Показываем текущий курс
-                if rates_cache:
-                    latest_date = max(rates_cache.keys())
-                    if rates_cache[latest_date]:
-                        usd_rate = rates_cache[latest_date].get('USD', 0)
-                        if usd_rate > 0:
-                            st.sidebar.metric("Курс USD", f"{usd_rate:.2f} ₽")
-                            st.sidebar.caption(f"на {latest_date}")
+                rates_history = filtered_df[['date', 'usd_rate']].drop_duplicates().sort_values('date').copy()
+                st.sidebar.success(f"✅ Загружены курсы для {len(rates_history)} дат")
             else:
                 st.sidebar.error("❌ Не удалось загрузить курсы. Используются доллары.")
                 use_rub = False
-                df['cost_display'] = df['cost_total']
+                filtered_df['cost_display'] = filtered_df['cost_total']
                 currency_symbol = "$"
-                currency_name = "долларах"
-    else:
-        # Используем доллары
-        df['cost_display'] = df['cost_total']
-        currency_symbol = "$"
-        currency_name = "долларах"
-    
-    # Боковая панель с фильтрами
-    st.sidebar.header("📊 Фильтры")
-    
-    # Фильтр по датам
-    min_date = df['date'].min()
-    max_date = df['date'].max()
-    date_range = st.sidebar.date_input(
-        "Период",
-        [min_date, max_date],
-        min_value=min_date,
-        max_value=max_date
-    )
-    
-    # Получаем уникальные значения
-    unique_projects = sorted(df['app_name'].unique().tolist())
-    unique_models = sorted(df['model_permaslug'].unique().tolist())
-    unique_api_keys = sorted(df['api_key_name'].unique().tolist())
-    
-    # Фильтры
-    projects = ['Все'] + unique_projects
-    selected_project = st.sidebar.selectbox("📁 Проект (app_name)", projects)
-    
-    api_keys = ['Все'] + unique_api_keys
-    selected_api_key = st.sidebar.selectbox("🔑 API Key (api_key_name)", api_keys)
-    
-    models = ['Все'] + unique_models
-    selected_model = st.sidebar.selectbox("🤖 Модель", models)
-    
-    # Применяем фильтры
-    mask = (df['date'] >= date_range[0]) & (df['date'] <= date_range[1])
-    if len(date_range) == 2:
-        mask = (df['date'] >= date_range[0]) & (df['date'] <= date_range[1])
-    else:
-        mask = (df['date'] >= date_range[0])
-    
-    filtered_df = df[mask]
-    
-    if selected_project != 'Все':
-        filtered_df = filtered_df[filtered_df['app_name'] == selected_project]
-    
-    if selected_api_key != 'Все':
-        filtered_df = filtered_df[filtered_df['api_key_name'] == selected_api_key]
-    
-    if selected_model != 'Все':
-        filtered_df = filtered_df[filtered_df['model_permaslug'] == selected_model]
-    
-    if len(filtered_df) == 0:
-        st.warning("⚠️ Нет данных для выбранных фильтров.")
-        st.stop()
-    
-    # ===== КЛЮЧЕВЫЕ МЕТРИКИ =====
-    st.header(f"📈 Ключевые метрики ({currency_symbol})")
-    
-    col1, col2, col3, col4, col5 = st.columns(5)
-    
-    total_tokens = filtered_df['tokens_prompt'].sum() + filtered_df['tokens_completion'].sum()
-    total_cost = filtered_df['cost_display'].sum()
-    total_requests = len(filtered_df)
-    avg_time = filtered_df['generation_time_ms'].mean()
-    
-    prompt_sum = filtered_df['tokens_prompt'].sum()
-    completion_sum = filtered_df['tokens_completion'].sum()
-    ratio = prompt_sum / completion_sum if completion_sum > 0 else 0
-    
-    with col1:
-        st.metric("💰 Общая стоимость", f"{currency_symbol}{total_cost:,.2f}")
-    with col2:
-        st.metric("🎯 Всего токенов", f"{total_tokens:,}")
-    with col3:
-        st.metric("📞 Запросов", total_requests)
-    with col4:
-        st.metric("⚡ Среднее время", f"{avg_time:.0f} мс")
-    with col5:
-        st.metric("📊 Входящие/Исходящие", f"{ratio:.1f}")
-    
-    # ===== ГРАФИКИ =====
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader(f"💰 Расходы по дням ({currency_symbol})")
-        daily_cost = filtered_df.groupby('date')['cost_display'].sum().reset_index()
-        if len(daily_cost) > 0:
-            fig = px.line(daily_cost, x='date', y='cost_display', title=f"Динамика затрат ({currency_symbol})")
-            fig.update_layout(xaxis_title="Дата", yaxis_title=f"Стоимость ({currency_symbol})")
-            st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.subheader("🎯 Токены по проектам")
-        project_tokens = filtered_df.groupby('app_name').agg({
-            'tokens_prompt': 'sum',
-            'tokens_completion': 'sum'
-        }).reset_index()
-        project_tokens['total'] = project_tokens['tokens_prompt'] + project_tokens['tokens_completion']
-        if len(project_tokens) > 0:
-            fig = px.bar(project_tokens, x='app_name', y='total', title="Токены по проектам")
-            fig.update_layout(xaxis_title="Проект", yaxis_title="Токены")
-            st.plotly_chart(fig, use_container_width=True)
-    
-    col3, col4 = st.columns(2)
-    
-    with col3:
-        st.subheader(f"🤖 Расходы по моделям ({currency_symbol})")
-        model_cost = filtered_df.groupby('model_permaslug')['cost_display'].sum().reset_index()
-        model_cost = model_cost.nlargest(10, 'cost_display')
-        if len(model_cost) > 0:
-            fig = px.pie(model_cost, values='cost_display', names='model_permaslug', title=f"Доля затрат по моделям ({currency_symbol})")
-            st.plotly_chart(fig, use_container_width=True)
-    
-    with col4:
-        st.subheader(f"🏢 Расходы по провайдерам ({currency_symbol})")
-        provider_cost = filtered_df.groupby('provider_name')['cost_display'].sum().reset_index()
-        if len(provider_cost) > 0:
-            fig = px.bar(provider_cost, x='provider_name', y='cost_display', title=f"Затраты по провайдерам ({currency_symbol})")
-            fig.update_layout(xaxis_title="Провайдер", yaxis_title=f"Стоимость ({currency_symbol})")
-            st.plotly_chart(fig, use_container_width=True)
-    
-    # ===== ДЕТАЛЬНАЯ СТАТИСТИКА ПО МОДЕЛЯМ =====
-    st.header(f"🎲 Детальная статистика по моделям ({currency_symbol})")
-    
-    model_details = filtered_df.groupby('model_permaslug').agg({
-        'tokens_prompt': 'sum',
-        'tokens_completion': 'sum',
-        'cost_display': 'sum',
-        'generation_id': 'count'
-    }).round(2)
-    
-    model_details.columns = [
-        'Входящие токены', 
-        'Исходящие токены', 
-        f'Стоимость ({currency_symbol})', 
-        'Кол-во запросов'
-    ]
-    
-    model_details['Всего токенов'] = model_details['Входящие токены'] + model_details['Исходящие токены']
-    model_details['Доля токенов (%)'] = (model_details['Всего токенов'] / model_details['Всего токенов'].sum() * 100).round(1)
-    model_details['Доля затрат (%)'] = (model_details[f'Стоимость ({currency_symbol})'] / model_details[f'Стоимость ({currency_symbol})'].sum() * 100).round(1)
-    
-    # Цены за 1 млн токенов с новыми названиями
-    model_details[f'Ср. цена за 1M (общая) ({currency_symbol})'] = (
-        model_details[f'Стоимость ({currency_symbol})'] / (model_details['Всего токенов'] + 1) * 1000000
-    ).round(2)
-    model_details[f'Ср. цена за 1M (входящие) ({currency_symbol})'] = (
-        model_details[f'Стоимость ({currency_symbol})'] / (model_details['Входящие токены'] + 1) * 1000000
-    ).round(2)
-    model_details[f'Ср. цена за 1M (исходящие) ({currency_symbol})'] = (
-        model_details[f'Стоимость ({currency_symbol})'] / (model_details['Исходящие токены'] + 1) * 1000000
-    ).round(2)
-    
-    model_details[f'Ср. стоимость запроса ({currency_symbol})'] = (
-        model_details[f'Стоимость ({currency_symbol})'] / model_details['Кол-во запросов']
-    ).round(6)
-    
-    model_details = model_details.sort_values(f'Стоимость ({currency_symbol})', ascending=False)
-    
-    # Форматирование для отображения
-    formatted_models = model_details.copy()
-    for col in formatted_models.columns:
-        if 'Ср. цена за 1M' in col:
-            formatted_models[col] = formatted_models[col].apply(lambda x: f"{currency_symbol}{x:,.2f}")
-        elif f'Стоимость ({currency_symbol})' in col and 'запроса' not in col:
-            formatted_models[col] = formatted_models[col].apply(lambda x: f"{currency_symbol}{x:.2f}")
-        elif f'Ср. стоимость запроса ({currency_symbol})' in col:
-            formatted_models[col] = formatted_models[col].apply(lambda x: f"{currency_symbol}{x:.6f}")
-        elif 'Доля' in col:
-            formatted_models[col] = formatted_models[col].apply(lambda x: f"{x}%")
-    
-    st.dataframe(formatted_models, use_container_width=True)
-    
-    # ===== ДЕТАЛЬНАЯ ТАБЛИЦА ПО ПРОЕКТАМ =====
-    st.subheader(f"📋 Детальная статистика по проектам ({currency_symbol})")
-    
-    project_details = filtered_df.groupby('app_name').agg({
-        'tokens_prompt': 'sum',
-        'tokens_completion': 'sum',
-        'cost_display': 'sum',
-        'generation_id': 'count',
-        'generation_time_ms': 'mean'
-    }).round(2)
-    
-    project_details.columns = [
-        'Входящие токены', 
-        'Исходящие токены', 
-        f'Стоимость ({currency_symbol})', 
-        'Запросы', 
-        'Ср. время (мс)'
-    ]
-    project_details['Всего токенов'] = project_details['Входящие токены'] + project_details['Исходящие токены']
-    project_details = project_details.sort_values(f'Стоимость ({currency_symbol})', ascending=False)
-    
-    # Форматирование
-    formatted_projects = project_details.copy()
-    formatted_projects[f'Стоимость ({currency_symbol})'] = formatted_projects[f'Стоимость ({currency_symbol})'].apply(lambda x: f"{currency_symbol}{x:.2f}")
-    
-    st.dataframe(formatted_projects, use_container_width=True)
-    
-    # ===== ДЕТАЛЬНАЯ ТАБЛИЦА ПО API-КЛЮЧАМ =====
-    st.subheader(f"🔑 Детальная статистика по API-ключам ({currency_symbol})")
-    
-    api_key_details = filtered_df.groupby('api_key_name').agg({
-        'tokens_prompt': 'sum',
-        'tokens_completion': 'sum',
-        'cost_display': 'sum',
-        'generation_id': 'count',
-        'app_name': lambda x: x.nunique(),
-        'model_permaslug': lambda x: x.nunique(),
-        'generation_time_ms': 'mean'
-    }).round(2)
-    
-    api_key_details.columns = [
-        'Входящие токены', 'Исходящие токены', f'Стоимость ({currency_symbol})', 
-        'Запросы', 'Проектов', 'Моделей', 'Ср. время (мс)'
-    ]
-    api_key_details['Всего токенов'] = api_key_details['Входящие токены'] + api_key_details['Исходящие токены']
-    api_key_details = api_key_details.sort_values(f'Стоимость ({currency_symbol})', ascending=False)
-    
-    formatted_keys = api_key_details.copy()
-    formatted_keys[f'Стоимость ({currency_symbol})'] = formatted_keys[f'Стоимость ({currency_symbol})'].apply(lambda x: f"{currency_symbol}{x:.2f}")
-    
-    st.dataframe(formatted_keys, use_container_width=True)
-    
-    # ===== ТОП-10 САМЫХ ДОРОГИХ ЗАПРОСОВ =====
-    st.subheader(f"💰 Топ-10 самых дорогих запросов ({currency_symbol})")
-    
-    available_cols = ['created_at', 'app_name', 'api_key_name', 'model_permaslug', 
-                      'tokens_prompt', 'tokens_completion', 'cost_display', 'generation_time_ms']
-    
-    expensive = filtered_df.nlargest(10, 'cost_display')[available_cols]
-    expensive.columns = ['Время', 'Проект', 'API Key', 'Модель', 'Входящие', 'Исходящие', f'Стоимость ({currency_symbol})', 'Время (мс)']
-    
-    # Форматирование
-    expensive[f'Стоимость ({currency_symbol})'] = expensive[f'Стоимость ({currency_symbol})'].apply(lambda x: f"{currency_symbol}{x:.4f}")
-    
-    st.dataframe(expensive, use_container_width=True)
-    
-    # ===== ГРАФИК РАСХОДОВ ПО API-КЛЮЧАМ =====
-    st.subheader(f"🔑 Расходы по API-ключам ({currency_symbol})")
-    
-    api_key_cost = filtered_df.groupby('api_key_name')['cost_display'].sum().reset_index()
-    api_key_cost = api_key_cost.sort_values('cost_display', ascending=False)
-    if len(api_key_cost) > 0:
-        fig = px.bar(api_key_cost.head(10), x='api_key_name', y='cost_display', 
-                    title=f"Топ-10 API-ключей по затратам ({currency_symbol})")
-        fig.update_layout(xaxis_title="API Key", yaxis_title=f"Стоимость ({currency_symbol})")
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # ===== ЭКСПОРТ =====
-    st.subheader("📥 Экспорт отчёта")
-    
-    output = io.BytesIO()
-    try:
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            filtered_df.to_excel(writer, sheet_name='Все данные', index=False)
-            model_details.to_excel(writer, sheet_name='Статистика по моделям')
-            project_details.to_excel(writer, sheet_name='Статистика по проектам')
-            api_key_details.to_excel(writer, sheet_name='Статистика по API-ключам')
-            expensive.to_excel(writer, sheet_name='Топ запросов', index=False)
-            if len(daily_cost) > 0:
-                daily_cost.to_excel(writer, sheet_name='Расходы по дням', index=False)
+        else:
+            filtered_df['cost_display'] = filtered_df['cost_total']
+            currency_symbol = "$"
         
-        st.download_button(
-            label="📊 Скачать Excel отчёт",
-            data=output.getvalue(),
-            file_name=f"token_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        # Динамика курса валют
+        if use_rub and 'rates_history' in locals() and len(rates_history) > 0:
+            st.subheader("📈 Динамика курса USD по дням")
+            
+            fig_rates = px.line(rates_history, x='date', y='usd_rate', title="Курс USD к RUB", markers=True)
+            fig_rates.update_layout(xaxis_title="Дата", yaxis_title="Курс (₽)", hovermode='x unified', height=400)
+            avg_rate = rates_history['usd_rate'].mean()
+            fig_rates.add_hline(y=avg_rate, line_dash="dash", line_color="green", annotation_text=f"Средний: {avg_rate:.2f} ₽")
+            st.plotly_chart(fig_rates, use_container_width=True)
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Курс на последнюю дату", f"{rates_history['usd_rate'].iloc[-1]:.2f} ₽")
+            with col2:
+                st.metric("Минимальный курс", f"{rates_history['usd_rate'].min():.2f} ₽")
+            with col3:
+                st.metric("Максимальный курс", f"{rates_history['usd_rate'].max():.2f} ₽")
+            with col4:
+                st.metric("Средний курс", f"{avg_rate:.2f} ₽")
+        
+        # Ключевые метрики
+        st.header(f"📈 Ключевые метрики ({currency_symbol})")
+        
+        total_tokens = filtered_df['total_tokens'].sum()
+        total_cost = filtered_df['cost_display'].sum()
+        total_requests = len(filtered_df)
+        avg_time = filtered_df['generation_time_ms'].mean()
+        
+        total_prompt = filtered_df['tokens_prompt'].sum()
+        total_completion = filtered_df['tokens_completion'].sum()
+        total_reasoning = filtered_df['tokens_reasoning'].sum()
+        total_cached = filtered_df['tokens_cached'].sum()
+        ratio = total_prompt / total_completion if total_completion > 0 else 0
+        
+        col1, col2, col3, col4, col5 = st.columns(5)
+        with col1:
+            st.metric("💰 Общая стоимость", f"{currency_symbol}{total_cost:,.2f}")
+        with col2:
+            st.metric("🎯 Всего токенов", f"{total_tokens:,}")
+        with col3:
+            st.metric("📞 Запросов", total_requests)
+        with col4:
+            st.metric("⚡ Среднее время", f"{avg_time:.0f} мс")
+        with col5:
+            st.metric("📊 Вх/Исх", f"{ratio:.1f}")
+        
+        st.caption(f"**Детализация токенов:** Входящие: {total_prompt:,} | Исходящие: {total_completion:,} | Токены рассуждений: {total_reasoning:,} | Кэшированные токены: {total_cached:,}")
+        
+        # Графики
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader(f"💰 Расходы по дням ({currency_symbol})")
+            daily_cost = filtered_df.groupby('date')['cost_display'].sum().reset_index()
+            if len(daily_cost) > 0:
+                fig = px.line(daily_cost, x='date', y='cost_display', title=f"Динамика затрат ({currency_symbol})", markers=True)
+                fig.update_layout(xaxis_title="Дата", yaxis_title=f"Стоимость ({currency_symbol})")
+                st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            st.subheader("🎯 Распределение токенов по типам")
+            token_distribution = pd.DataFrame({
+                'Тип токенов': ['Входящие', 'Исходящие', 'Токены рассуждений', 'Кэшированные'],
+                'Количество': [total_prompt, total_completion, total_reasoning, total_cached]
+            })
+            token_distribution = token_distribution[token_distribution['Количество'] > 0]
+            if len(token_distribution) > 0:
+                fig = px.pie(token_distribution, values='Количество', names='Тип токенов', 
+                            title="Распределение токенов по типам")
+                st.plotly_chart(fig, use_container_width=True)
+        
+        # Детализация расходов по дням
+        if len(daily_cost) > 0:
+            with st.expander("📊 Детализация расходов по дням", expanded=False):
+                # Собираем детальную информацию по дням
+                daily_detail = filtered_df.groupby('date').agg({
+                    'cost_display': 'sum',
+                    'generation_id': 'count',
+                    'model_permaslug': 'nunique',
+                    'api_key_name': 'nunique',
+                    'app_name': 'nunique',
+                    'tokens_prompt': 'sum',
+                    'tokens_completion': 'sum',
+                    'tokens_reasoning': 'sum',
+                    'tokens_cached': 'sum',
+                    'total_tokens': 'sum'
+                }).reset_index()
+                
+                # Сортируем хронологически
+                daily_detail = daily_detail.sort_values('date')
+                daily_detail['date'] = pd.to_datetime(daily_detail['date']).dt.strftime('%d.%m.%Y')
+                
+                # Рассчитываем долю затрат
+                total_sum = daily_detail['cost_display'].sum()
+                daily_detail['Доля затрат'] = (daily_detail['cost_display'] / total_sum * 100).round(2)
+                
+                # Переименовываем колонки
+                daily_detail.columns = [
+                    'Дата', 'Стоимость', 'Запросы', 'Модели', 'API-ключи', 'Проекты',
+                    'Входящие', 'Исходящие', 'Рассуждений', 'Кэшированные', 'Всего токенов', 'Доля затрат (%)'
+                ]
+                
+                # Форматируем
+                daily_detail['Стоимость'] = daily_detail['Стоимость'].apply(lambda x: f"{currency_symbol}{x:,.2f}")
+                daily_detail['Доля затрат (%)'] = daily_detail['Доля затрат (%)'].apply(lambda x: f"{x:.2f}%")
+                
+                # Добавляем разделители тысяч для чисел
+                for col in ['Запросы', 'Модели', 'API-ключи', 'Проекты', 'Входящие', 'Исходящие', 'Рассуждений', 'Кэшированные', 'Всего токенов']:
+                    daily_detail[col] = daily_detail[col].apply(lambda x: f"{int(x):,}")
+                
+                st.dataframe(daily_detail, use_container_width=True, hide_index=True)
+                
+                # Итоговая статистика
+                st.markdown("---")
+                col_a, col_b, col_c, col_d = st.columns(4)
+                with col_a:
+                    st.metric("📅 Всего дней", len(daily_detail))
+                with col_b:
+                    st.metric("💰 Общая стоимость", f"{currency_symbol}{total_sum:,.2f}")
+                with col_c:
+                    st.metric("📊 Всего запросов", f"{filtered_df['generation_id'].count():,}")
+                with col_d:
+                    st.metric("🤖 Уникальных моделей", filtered_df['model_permaslug'].nunique())
+        
+        col3, col4 = st.columns(2)
+        
+        with col3:
+            st.subheader(f"🤖 Расходы по моделям ({currency_symbol})")
+            model_cost = filtered_df.groupby('model_permaslug')['cost_display'].sum().reset_index()
+            model_cost = model_cost.nlargest(10, 'cost_display')
+            if len(model_cost) > 0:
+                fig = px.pie(model_cost, values='cost_display', names='model_permaslug', title=f"Доля затрат по моделям ({currency_symbol})")
+                st.plotly_chart(fig, use_container_width=True)
+        
+        with col4:
+            st.subheader(f"🏢 Расходы по провайдерам ({currency_symbol})")
+            provider_cost = filtered_df.groupby('provider_name')['cost_display'].sum().reset_index()
+            if len(provider_cost) > 0:
+                fig = px.bar(provider_cost, x='provider_name', y='cost_display', title=f"Затраты по провайдерам ({currency_symbol})")
+                fig.update_layout(xaxis_title="Провайдер", yaxis_title=f"Стоимость ({currency_symbol})")
+                st.plotly_chart(fig, use_container_width=True)
+        
+        # Детальная статистика по моделям
+        st.header(f"🎲 Детальная статистика по моделям ({currency_symbol})")
+        model_details = filtered_df.groupby('model_permaslug').agg({
+            'tokens_prompt': 'sum', 'tokens_completion': 'sum', 'tokens_reasoning': 'sum', 'tokens_cached': 'sum',
+            'cost_display': 'sum', 'generation_id': 'count'
+        }).round(2).reset_index()
+        model_details.columns = ['ИИ-модель', 'Входящие', 'Исходящие', 'Рассуждений', 'Кэшированные', f'Стоимость ({currency_symbol})', 'Запросы']
+        model_details['Всего токенов'] = model_details['Входящие'] + model_details['Исходящие'] + model_details['Рассуждений'] + model_details['Кэшированные']
+        model_details = model_details.sort_values(f'Стоимость ({currency_symbol})', ascending=False)
+        st.dataframe(model_details, use_container_width=True, hide_index=True)
+        
+        # Детальная статистика по проектам
+        st.subheader(f"📋 Детальная статистика по проектам ({currency_symbol})")
+        project_main_key = filtered_df.groupby('app_name')['api_key_name'].agg(lambda x: x.mode()[0] if len(x.mode()) > 0 else 'unknown')
+        project_details = filtered_df.groupby('app_name').agg({
+            'tokens_prompt': 'sum', 'tokens_completion': 'sum', 'tokens_reasoning': 'sum', 'tokens_cached': 'sum',
+            'cost_display': 'sum', 'generation_id': 'count', 'generation_time_ms': 'mean'
+        }).round(2).reset_index()
+        project_details = project_details.rename(columns={'app_name': 'Проект'})
+        project_details.insert(1, 'API-ключ', project_details['Проект'].map(project_main_key))
+        project_details.columns = ['Проект', 'API-ключ', 'Входящие', 'Исходящие', 'Рассуждений', 'Кэшированные', f'Стоимость ({currency_symbol})', 'Запросы', 'Ср.время(мс)']
+        project_details['Всего токенов'] = project_details['Входящие'] + project_details['Исходящие'] + project_details['Рассуждений'] + project_details['Кэшированные']
+        project_details = project_details.sort_values(f'Стоимость ({currency_symbol})', ascending=False)
+        st.dataframe(project_details, use_container_width=True, hide_index=True)
+        
+        # Аналитика по API-ключам
+        st.header(f"🔑 Аналитика по API-ключам ({currency_symbol})")
+        
+        api_details = filtered_df.groupby('api_key_name').agg({
+            'tokens_prompt': 'sum', 'tokens_completion': 'sum', 'tokens_reasoning': 'sum', 'tokens_cached': 'sum',
+            'cost_display': 'sum', 'generation_id': 'count', 'app_name': 'nunique', 'model_permaslug': 'nunique', 'generation_time_ms': 'mean'
+        }).round(2).reset_index()
+        api_details.columns = ['API-ключ', 'Входящие', 'Исходящие', 'Рассуждений', 'Кэшированные', f'Стоимость ({currency_symbol})', 'Запросы', 'Проектов', 'Моделей', 'Ср.время(мс)']
+        api_details['Всего токенов'] = api_details['Входящие'] + api_details['Исходящие'] + api_details['Рассуждений'] + api_details['Кэшированные']
+        api_details = api_details.sort_values(f'Стоимость ({currency_symbol})', ascending=False)
+        
+        tab1, tab2, tab3 = st.tabs(["📊 Таблица", "📈 Графики", "🔥 Тепловая карта"])
+        
+        with tab1:
+            st.dataframe(api_details, use_container_width=True, hide_index=True)
+            st.subheader("🏆 Топ-5 затратных ключей")
+            st.dataframe(api_details.head(5)[['API-ключ', f'Стоимость ({currency_symbol})', 'Запросы', 'Проектов']], use_container_width=True, hide_index=True)
+        
+        with tab2:
+            fig_cost = px.bar(api_details.head(10), x='API-ключ', y=f'Стоимость ({currency_symbol})', title="Топ-10 по затратам", text=f'Стоимость ({currency_symbol})')
+            fig_cost.update_traces(texttemplate='%{text:.2f}', textposition='outside')
+            fig_cost.update_layout(xaxis_tickangle=-45)
+            st.plotly_chart(fig_cost, use_container_width=True)
+            
+            fig_req = px.bar(api_details.head(10), x='API-ключ', y='Запросы', title="Топ-10 по запросам", text='Запросы')
+            fig_req.update_traces(texttemplate='%{text:,}', textposition='outside')
+            fig_req.update_layout(xaxis_tickangle=-45)
+            st.plotly_chart(fig_req, use_container_width=True)
+        
+        with tab3:
+            api_daily = filtered_df.groupby(['api_key_name', 'date'])['cost_display'].sum().reset_index()
+            pivot_api = api_daily.pivot(index='api_key_name', columns='date', values='cost_display').fillna(0)
+            if len(pivot_api) > 0:
+                fig_heat = px.imshow(pivot_api, labels=dict(x="Дата", y="API-ключ", color=f"Стоимость ({currency_symbol})"), aspect="auto", color_continuous_scale="Viridis")
+                st.plotly_chart(fig_heat, use_container_width=True)
+        
+        # Топ-10 дорогих запросов
+        st.header(f"💰 Топ-10 самых дорогих запросов ({currency_symbol})")
+        top_cols = ['created_at', 'app_name', 'api_key_name', 'model_permaslug', 'tokens_prompt', 'tokens_completion', 'tokens_reasoning', 'tokens_cached', 'cost_display', 'generation_time_ms', 'generation_id']
+        expensive = filtered_df.nlargest(10, 'cost_display')[top_cols].copy().reset_index(drop=True)
+        expensive.columns = ['Дата и время', 'Проект', 'API-ключ', 'Модель', 'Входящие', 'Исходящие', 'Рассуждений', 'Кэшированные', f'Стоимость ({currency_symbol})', 'Время (мс)', 'ID запроса']
+        st.dataframe(expensive, use_container_width=True, hide_index=True)
+        
+        # Экспорт отчёта
+        st.header("📥 Экспорт отчёта")
+        html_report = create_html_report(filtered_df, model_details, project_details, api_details, expensive, currency_symbol)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button("📄 Скачать HTML отчёт", html_report.encode('utf-8'), f"ai_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html", "text/html", use_container_width=True)
+        with col2:
+            csv_data = filtered_df.to_csv(index=False).encode('utf-8-sig')
+            st.download_button("📊 Скачать CSV данные", csv_data, f"filtered_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", "text/csv", use_container_width=True)
+    
     except Exception as e:
-        st.error(f"Ошибка при создании Excel: {e}")
-    
-    # ===== СТАТИСТИКА В САЙДБАРЕ =====
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### 📊 Статистика")
-    st.sidebar.markdown(f"**Записей:** {len(filtered_df):,}")
-    st.sidebar.markdown(f"**Уникальных проектов:** {filtered_df['app_name'].nunique()}")
-    st.sidebar.markdown(f"**Уникальных API-ключей:** {filtered_df['api_key_name'].nunique()}")
-    st.sidebar.markdown(f"**Уникальных моделей:** {filtered_df['model_permaslug'].nunique()}")
-    
-    st.sidebar.markdown("---")
-    st.sidebar.markdown(f"**Период:** {filtered_df['date'].min()} → {filtered_df['date'].max()}")
-    st.sidebar.markdown(f"**Всего токенов:** {total_tokens:,}")
-
-else:
-    st.info("👈 Загрузите CSV файл с логами для начала анализа")
-    
-    st.markdown("""
-    ### Как использовать:
-    1. Подготовьте CSV файл с вашими логами
-    2. Нажмите "Browse files" выше
-    3. Выберите файл
-    4. Используйте фильтры слева
-    
-    ### 💱 Выбор валюты:
-    - **Включите чекбокс** "Показывать цены в рублях" для отображения всех цен в рублях
-    - **Выключите чекбокс** для отображения цен в долларах США
-    - При выборе рублей, курсы автоматически загружаются с API ЦБ РФ
-    - Конвертация происходит по курсу на **дату каждой операции**
-    
-    ### 📊 Что означают колонки в статистике по моделям:
-    - **Входящие токены** - токены, отправленные в API (prompt)
-    - **Исходящие токены** - токены, полученные от API (completion)
-    - **Ср. цена за 1M (общая)** - средняя фактическая цена за 1 млн всех токенов
-    - **Ср. цена за 1M (входящие)** - средняя фактическая цена за 1 млн входящих токенов
-    - **Ср. цена за 1M (исходящие)** - средняя фактическая цена за 1 млн исходящих токенов
-    
-    ### Ожидаемая структура CSV:
-    - `created_at` - дата и время запроса
-    - `tokens_prompt` - входящие токены
-    - `tokens_completion` - исходящие токены
-    - `cost_total` - общая стоимость в USD
-    - `app_name` - название проекта
-    - `api_key_name` - название API-ключа
-    - `model_permaslug` - модель ИИ
-    - `provider_name` - провайдер
-    - `generation_time_ms` - время ответа
-    """)
+        st.error(f"❌ Ошибка при обработке файла: {str(e)}")
+        st.info("Пожалуйста, проверьте формат CSV файла и попробуйте снова.")
